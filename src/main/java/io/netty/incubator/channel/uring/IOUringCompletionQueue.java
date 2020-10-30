@@ -22,7 +22,7 @@ import static io.netty.incubator.channel.uring.UserData.decode;
 /**
  * Completion queue implementation for io_uring.
  */
-final class IOUringCompletionQueue {
+public final class IOUringCompletionQueue {
 
     //these offsets are used to access specific properties
     //CQE (https://github.com/axboe/liburing/blob/master/src/include/liburing/io_uring.h#L162)
@@ -63,7 +63,7 @@ final class IOUringCompletionQueue {
      * Returns {@code true} if any completion event is ready to be processed by
      * {@link #process(IOUringCompletionQueueCallback)}, {@code false} otherwise.
      */
-    boolean hasCompletions() {
+    public boolean hasCompletions() {
         return ringHead != PlatformDependent.getIntVolatile(kTailAddress);
     }
 
@@ -71,7 +71,7 @@ final class IOUringCompletionQueue {
      * Process the completion events in the {@link IOUringCompletionQueue} and return the number of processed
      * events.
      */
-    int process(IOUringCompletionQueueCallback callback) {
+    public int process(IOUringCompletionQueueCallback callback) {
         int tail = PlatformDependent.getIntVolatile(kTailAddress);
         int i = 0;
         while (ringHead != tail) {
@@ -92,10 +92,31 @@ final class IOUringCompletionQueue {
         return i;
     }
 
+    public int processSimple(IOUringCompletionQueueSimpleCallback callback) {
+        int tail = PlatformDependent.getIntVolatile(kTailAddress);
+        int i = 0;
+        while (ringHead != tail) {
+            long cqeAddress = completionQueueArrayAddress + (ringHead & ringMask) * CQE_SIZE;
+
+            long udata = PlatformDependent.getLong(cqeAddress + CQE_USER_DATA_FIELD);
+            int res = PlatformDependent.getInt(cqeAddress + CQE_RES_FIELD);
+            int flags = PlatformDependent.getInt(cqeAddress + CQE_FLAGS_FIELD);
+
+            //Ensure that the kernel only sees the new value of the head index after the CQEs have been read.
+            ringHead++;
+            PlatformDependent.putIntOrdered(kHeadAddress, ringHead);
+
+            i++;
+
+            callback.handle(res, flags, udata);
+        }
+        return i;
+    }
+
     /**
      * Block until there is at least one completion ready to be processed.
      */
-    void ioUringWaitCqe() {
+    public void ioUringWaitCqe() {
         int ret = Native.ioUringEnter(ringFd, 0, 1, Native.IORING_ENTER_GETEVENTS);
         if (ret < 0) {
             throw new RuntimeException("ioUringEnter syscall returned " + ret);

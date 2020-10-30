@@ -27,11 +27,14 @@ import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
 import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Queue;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicLong;
 
-final class IOUringEventLoop extends SingleThreadEventLoop implements IOUringCompletionQueueCallback {
+public final class IOUringEventLoop extends SingleThreadEventLoop implements IOUringCompletionQueueCallback, IOUringCompletionQueueSimpleCallback {
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(IOUringEventLoop.class);
 
     private final long eventfdReadBuf = PlatformDependent.allocateMemory(8);
@@ -56,6 +59,10 @@ final class IOUringEventLoop extends SingleThreadEventLoop implements IOUringCom
     private long prevDeadlineNanos = NONE;
     private boolean pendingWakeup;
 
+    private final AtomicLong opSeq = new AtomicLong();
+    private final Map<Long, MappingVal> resultMappings = new HashMap<>();
+    private Thread thread;
+
     IOUringEventLoop(IOUringEventLoopGroup parent, Executor executor, int ringSize, int iosqeAsyncThreshold,
                      RejectedExecutionHandler rejectedExecutionHandler, EventLoopTaskQueueFactory queueFactory) {
         super(parent, executor, false, newTaskQueue(queueFactory), newTaskQueue(queueFactory),
@@ -63,7 +70,7 @@ final class IOUringEventLoop extends SingleThreadEventLoop implements IOUringCom
         // Ensure that we load all native bits as otherwise it may fail when try to use native methods in IovArray
         IOUring.ensureAvailability();
 
-        ringBuffer = Native.createRingBuffer(ringSize, iosqeAsyncThreshold);
+        ringBuffer = Native.createRingBuffer(ringSize, iosqeAsyncThreshold, this);
 
         eventfd = Native.newBlockingEventFd();
         logger.trace("New EventLoop: {}", this.toString());
@@ -132,12 +139,13 @@ final class IOUringEventLoop extends SingleThreadEventLoop implements IOUringCom
         final IOUringCompletionQueue completionQueue = ringBuffer.ioUringCompletionQueue();
         final IOUringSubmissionQueue submissionQueue = ringBuffer.ioUringSubmissionQueue();
 
+        thread = Thread.currentThread();
+
         // Lets add the eventfd related events before starting to do any real work.
         addEventFdRead(submissionQueue);
 
         for (;;) {
             try {
-                logger.trace("Run IOUringEventLoop {}", this);
 
                 // Prepare to block wait
                 long curDeadlineNanos = nextScheduledTaskDeadlineNanos();
@@ -158,7 +166,6 @@ final class IOUringEventLoop extends SingleThreadEventLoop implements IOUringCom
                         // Check there were any completion events to process
                         if (!completionQueue.hasCompletions()) {
                             // Block if there is nothing to process after this try again to call process(....)
-                            logger.trace("submitAndWait {}", this);
                             submissionQueue.submitAndWait();
                         }
                     }
@@ -178,7 +185,7 @@ final class IOUringEventLoop extends SingleThreadEventLoop implements IOUringCom
                     // CQE processing can produce tasks, and new CQEs could arrive while
                     // processing tasks. So run both on every iteration and break when
                     // they both report that nothing was done (| means always run both).
-                    maybeMoreWork = completionQueue.process(this) != 0 | runAllTasks();
+                    maybeMoreWork = completionQueue.processSimple(this) != 0 | runAllTasks();
                 } catch (Throwable t) {
                     handleLoopException(t);
                 }
@@ -215,8 +222,55 @@ final class IOUringEventLoop extends SingleThreadEventLoop implements IOUringCom
         }
     }
 
+    private void checkThread() {
+        if (Thread.currentThread() != thread) {
+            throw new IllegalStateException("Called on wrong thread, expected " + thread + " got " + Thread.currentThread());
+        }
+    }
+
+    // We indirect through here so we can make the original data into a value from a sequence
+    // so we can support user operations too which might otherwise have clashing data values
+    boolean enqueueSqe(byte op, int flags, int rwFlags, int fd,
+                       long bufferAddress, int length, long offset, short data) {
+        long opNumber = opSeq.getAndIncrement();
+        checkThread();
+        if (resultMappings.containsKey(opNumber)) {
+            throw new IllegalStateException("Already got mapping for " + opNumber);
+        }
+        long userData = UserData.encode(fd, op, data);
+        resultMappings.put(opNumber, new MappingVal(userData));
+        return ringBuffer.ioUringSubmissionQueue().enqueueSqeInternal(op, flags, rwFlags, fd, bufferAddress, length, offset,
+                opNumber);
+    }
+
+    public boolean addUserWrite(int fd, long bufferAddress, int pos, int limit, CompletableFuture<Integer> future) {
+        long opNumber = createOp(future);
+        return ringBuffer.ioUringSubmissionQueue().addWriteDirect(fd, bufferAddress, pos, limit, opNumber);
+    }
+
+    public boolean addUserFsync(int fd, int flags, CompletableFuture<Integer> future) {
+        long opNumber = createOp(future);
+        return ringBuffer.ioUringSubmissionQueue().addFsync(fd, flags, opNumber);
+    }
+
+    public boolean addUserSyncFileRange(int fd, long offset, int length, int flags, CompletableFuture<Integer> future) {
+        long opNumber = createOp(future);
+        return ringBuffer.ioUringSubmissionQueue().addSyncFileRange(fd, offset, length, flags, opNumber);
+    }
+
+    private long createOp(CompletableFuture<Integer> future) {
+        long opNumber = opSeq.getAndIncrement();
+        checkThread();
+        if (resultMappings.containsKey(opNumber)) {
+            throw new IllegalStateException("Already got mapping for " + opNumber);
+        }
+        resultMappings.put(opNumber, new MappingVal(future));
+        return opNumber;
+    }
+
     @Override
     public void handle(int fd, int res, int flags, byte op, short data) {
+
         if (op == Native.IORING_OP_READ && eventfd.intValue() == fd) {
             pendingWakeup = false;
             addEventFdRead(ringBuffer.ioUringSubmissionQueue());
@@ -254,6 +308,22 @@ final class IOUringEventLoop extends SingleThreadEventLoop implements IOUringCom
             }
             channel.ioUringUnsafe().processDelayedClose();
         }
+
+    }
+
+    @Override
+    public void handle(int res, int flags, long userData) {
+        checkThread();
+        MappingVal val = resultMappings.remove(userData);
+        if (val == null) {
+            throw new IllegalStateException("Cannot find data mapping " + userData);
+        }
+        if (val.future != null) {
+            val.future.complete(res);
+        } else {
+            UserData.decode(res, flags, val.data, this);
+        }
+
     }
 
     private void handleRead(AbstractIOUringChannel channel, int res, int data) {
@@ -314,7 +384,7 @@ final class IOUringEventLoop extends SingleThreadEventLoop implements IOUringCom
         PlatformDependent.freeMemory(eventfdReadBuf);
     }
 
-    RingBuffer getRingBuffer() {
+    public RingBuffer getRingBuffer() {
         return ringBuffer;
     }
 
@@ -339,4 +409,20 @@ final class IOUringEventLoop extends SingleThreadEventLoop implements IOUringCom
     byte[] inet6AddressArray() {
         return inet6AddressArray;
     }
+
+    private static class MappingVal {
+        final long data;
+        final CompletableFuture<Integer> future;
+
+        public MappingVal(long data) {
+            this.data = data;
+            this.future = null;
+        }
+
+        public MappingVal(CompletableFuture<Integer> future) {
+            this.future = future;
+            this.data = -1;
+        }
+    }
+
 }

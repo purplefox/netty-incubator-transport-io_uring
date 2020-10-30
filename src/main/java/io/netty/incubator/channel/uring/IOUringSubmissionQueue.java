@@ -23,7 +23,7 @@ import static io.netty.incubator.channel.uring.UserData.encode;
 import static java.lang.Math.max;
 import static java.lang.Math.min;
 
-final class IOUringSubmissionQueue {
+public final class IOUringSubmissionQueue {
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(IOUringSubmissionQueue.class);
 
     private static final long SQE_SIZE = 64;
@@ -66,10 +66,13 @@ final class IOUringSubmissionQueue {
     private int head;
     private int tail;
 
+    private final IOUringEventLoop eventLoop;
+
     IOUringSubmissionQueue(long kHeadAddress, long kTailAddress, long kRingMaskAddress, long kRingEntriesAddress,
                            long kFlagsAddress, long kDroppedAddress, long kArrayAddress,
                            long submissionQueueArrayAddress, int ringSize, long ringAddress, int ringFd,
-                           int iosqeAsyncThreshold) {
+                           int iosqeAsyncThreshold,
+                           IOUringEventLoop eventLoop) {
         this.kHeadAddress = kHeadAddress;
         this.kTailAddress = kTailAddress;
         this.kFlagsAddress = kFlagsAddress;
@@ -86,6 +89,8 @@ final class IOUringSubmissionQueue {
 
         this.timeoutMemoryAddress = PlatformDependent.allocateMemory(KERNEL_TIMESPEC_SIZE);
         this.iosqeAsyncThreshold = iosqeAsyncThreshold;
+
+        this.eventLoop = eventLoop;
 
         // Zero the whole SQE array first
         PlatformDependent.setMemory(submissionQueueArrayAddress, ringEntries * SQE_SIZE, (byte) 0);
@@ -110,8 +115,13 @@ final class IOUringSubmissionQueue {
         return numHandledFds < iosqeAsyncThreshold ? 0 : Native.IOSQE_ASYNC;
     }
 
-    private boolean enqueueSqe(byte op, int flags, int rwFlags, int fd,
+    boolean enqueueSqe(byte op, int flags, int rwFlags, int fd,
                                long bufferAddress, int length, long offset, short data) {
+        return eventLoop.enqueueSqe(op, flags, rwFlags, fd, bufferAddress, length, offset, data);
+    }
+
+    boolean enqueueSqeInternal(byte op, int flags, int rwFlags, int fd,
+                               long bufferAddress, int length, long offset, long userData) {
         int pending = tail - head;
         boolean submit = pending == ringEntries;
         if (submit) {
@@ -122,12 +132,12 @@ final class IOUringSubmissionQueue {
             }
         }
         long sqe = submissionQueueArrayAddress + (tail++ & ringMask) * SQE_SIZE;
-        setData(sqe, op, flags, rwFlags, fd, bufferAddress, length, offset, data);
+        setData(sqe, op, flags, rwFlags, fd, bufferAddress, length, offset, userData);
         return submit;
     }
 
     private void setData(long sqe, byte op, int flags, int rwFlags, int fd, long bufferAddress, int length,
-                         long offset, short data) {
+                         long offset, long userData) {
         //set sqe(submission queue) properties
 
         PlatformDependent.putByte(sqe + SQE_OP_CODE_FIELD, op);
@@ -139,13 +149,7 @@ final class IOUringSubmissionQueue {
         PlatformDependent.putLong(sqe + SQE_ADDRESS_FIELD, bufferAddress);
         PlatformDependent.putInt(sqe + SQE_LEN_FIELD, length);
         PlatformDependent.putInt(sqe + SQE_RW_FLAGS_FIELD, rwFlags);
-        long userData = encode(fd, op, data);
         PlatformDependent.putLong(sqe + SQE_USER_DATA_FIELD, userData);
-
-        logger.trace("UserDataField: {}", userData);
-        logger.trace("BufferAddress: {}", bufferAddress);
-        logger.trace("Length: {}", length);
-        logger.trace("Offset: {}", offset);
     }
 
     boolean addTimeout(long nanoSeconds, short extraData) {
@@ -169,6 +173,18 @@ final class IOUringSubmissionQueue {
         return enqueueSqe(Native.IORING_OP_POLL_ADD, 0, pollMask, fd, 0, 0, 0, (short) pollMask);
     }
 
+    boolean addFsync(int fd, int fsyncFlags, long opNumber) {
+        return enqueueSqeInternal(Native.IORING_OP_FSYNC, flags(), fsyncFlags, fd, 0, 0, 0, opNumber);
+    }
+
+    boolean addSyncFileRange(int fd, long offset, int length, int syncFileRangeFlags, long opNumber) {
+        return enqueueSqeInternal(Native.IORING_OP_SYNCFILERANGE, flags(), syncFileRangeFlags, fd, 0, length, offset, opNumber);
+    }
+
+    public boolean addWriteDirect(int fd, long bufferAddress, int pos, int limit, long extraData) {
+        return enqueueSqeInternal(Native.IORING_OP_WRITE, flags(), 0, fd, bufferAddress + pos, limit - pos, 0, extraData);
+    }
+
     boolean addRecvmsg(int fd, long msgHdr, short extraData) {
         return enqueueSqe(Native.IORING_OP_RECVMSG, flags(), 0, fd, msgHdr, 1, 0, extraData);
     }
@@ -177,13 +193,19 @@ final class IOUringSubmissionQueue {
         return enqueueSqe(Native.IORING_OP_SENDMSG, flags(), 0, fd, msgHdr, 1, 0, extraData);
     }
 
-    boolean addRead(int fd, long bufferAddress, int pos, int limit, short extraData) {
+    public boolean addRead(int fd, long bufferAddress, int pos, int limit, short extraData) {
         return enqueueSqe(Native.IORING_OP_READ, flags(), 0, fd, bufferAddress + pos, limit - pos, 0, extraData);
     }
 
-    boolean addWrite(int fd, long bufferAddress, int pos, int limit, short extraData) {
+    public boolean addReadAtOffset(int fd, long bufferAddress, int pos, int limit, long offset, short extraData) {
+        return enqueueSqe(Native.IORING_OP_READ, flags(), 0, fd, bufferAddress + pos, limit - pos, offset, extraData);
+    }
+
+    public boolean addWrite(int fd, long bufferAddress, int pos, int limit, short extraData) {
         return enqueueSqe(Native.IORING_OP_WRITE, flags(), 0, fd, bufferAddress + pos, limit - pos, 0, extraData);
     }
+
+
 
     boolean addAccept(int fd, long address, long addressLength, short extraData) {
         return enqueueSqe(Native.IORING_OP_ACCEPT, flags(), Native.SOCK_NONBLOCK | Native.SOCK_CLOEXEC, fd,
@@ -205,16 +227,16 @@ final class IOUringSubmissionQueue {
         return enqueueSqe(Native.IORING_OP_WRITEV, flags(), 0, fd, iovecArrayAddress, length, 0, extraData);
     }
 
-    boolean addClose(int fd, short extraData) {
+    public boolean addClose(int fd, short extraData) {
         return enqueueSqe(Native.IORING_OP_CLOSE, flags(), 0, fd, 0, 0, 0, extraData);
     }
 
-    int submit() {
+    public int submit() {
         int submit = tail - head;
         return submit > 0 ? submit(submit, 0, 0) : 0;
     }
 
-    int submitAndWait() {
+    public int submitAndWait() {
         int submit = tail - head;
         if (submit > 0) {
             return submit(submit, 1, Native.IORING_ENTER_GETEVENTS);
@@ -227,7 +249,7 @@ final class IOUringSubmissionQueue {
         return ret; // should be 0
     }
 
-    private int submit(int toSubmit, int minComplete, int flags) {
+    public int submit(int toSubmit, int minComplete, int flags) {
         PlatformDependent.putIntOrdered(kTailAddress, tail); // release memory barrier
         int ret = Native.ioUringEnter(ringFd, toSubmit, minComplete, flags);
         head = PlatformDependent.getIntVolatile(kHeadAddress); // acquire memory barrier

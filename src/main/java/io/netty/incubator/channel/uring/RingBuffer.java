@@ -16,7 +16,7 @@
 package io.netty.incubator.channel.uring;
 
 
-final class RingBuffer {
+public final class RingBuffer {
     private final IOUringSubmissionQueue ioUringSubmissionQueue;
     private final IOUringCompletionQueue ioUringCompletionQueue;
 
@@ -25,19 +25,19 @@ final class RingBuffer {
         this.ioUringCompletionQueue = ioUringCompletionQueue;
     }
 
-    int fd() {
+    public int fd() {
         return ioUringCompletionQueue.ringFd;
     }
 
-    IOUringSubmissionQueue ioUringSubmissionQueue() {
+    public IOUringSubmissionQueue ioUringSubmissionQueue() {
         return this.ioUringSubmissionQueue;
     }
 
-    IOUringCompletionQueue ioUringCompletionQueue() {
+    public IOUringCompletionQueue ioUringCompletionQueue() {
         return this.ioUringCompletionQueue;
     }
 
-    void close() {
+    public void close() {
         ioUringSubmissionQueue.release();
         Native.ioUringExit(
                 ioUringSubmissionQueue.submissionQueueArrayAddress,

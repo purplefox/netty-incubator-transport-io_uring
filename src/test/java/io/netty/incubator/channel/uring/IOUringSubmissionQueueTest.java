@@ -34,7 +34,7 @@ public class IOUringSubmissionQueueTest {
 
     @Test
     public void sqeFullTest() {
-        RingBuffer ringBuffer = Native.createRingBuffer(8);
+        RingBuffer ringBuffer = Native.createRingBuffer(8, null);
         ByteBuffer buffer = Buffer.allocateDirectWithNativeOrder(128);
         try {
             IOUringSubmissionQueue submissionQueue = ringBuffer.ioUringSubmissionQueue();
